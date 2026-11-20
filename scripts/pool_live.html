@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server Dashboard</title>
+<style>
+  /* One column: status line, totals, then one block per host with GPU and disk cells. */
+  /* Always dark, whatever the system theme: it is a wall-monitor view. */
+  :root {
+    --bg: #111614; --panel: #19201d; --fg: #e6ece8; --muted: #93a099; --line: #2a332f;
+    --track: #252d29; --busy: #5f6b65; --heat: #6ea3ff; --ok: #4cc27f; --warn: #e0a84a; --bad: #ef6b5b; --heat-ink: #0b1220;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); font-variant-numeric: tabular-nums; }
+  main { max-width: 1280px; margin: 0 auto; padding: 20px max(16px, env(safe-area-inset-right, 0px)) 40px max(16px, env(safe-area-inset-left, 0px)); display: flex; flex-direction: column; gap: 20px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0; }
+  .status { color: var(--muted); font-size: 13px; display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--busy); flex: none; }
+  .ok > .dot, .dot.ok { background: var(--ok); }
+  .warn > .dot { background: var(--warn); }
+  .bad > .dot, .dot.bad { background: var(--bad); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .tile span { display: block; color: var(--muted); font-size: 12px; }
+  .tile b { font-size: 26px; font-weight: 600; }
+  .tile small { color: var(--muted); font-size: 14px; font-weight: 400; }
+  .hosts { display: flex; flex-direction: column; gap: 14px; }
+  .host { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .host-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+  .host-name { font-weight: 600; font-size: 15px; }
+  .meta { color: var(--muted); font-size: 12.5px; }
+  .meta b { color: var(--fg); font-weight: 600; }
+  .err { color: var(--bad); font-size: 13px; overflow-wrap: anywhere; }
+  .label { color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+  .cells { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
+  .cell { border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .cell.ok { border-color: var(--ok); }
+  .cell.warn { border-color: var(--warn); }
+  .cell.bad { border-color: var(--bad); }
+  .cell-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; font-size: 12px; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+  .vals { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .vals b { color: var(--fg); font-weight: 600; }
+  .mount { font: 12px var(--mono); overflow-wrap: anywhere; }
+  .metric { display: flex; flex-direction: column; gap: 2px; font-size: 11.5px; color: var(--muted); }
+  .metric .bar { height: 3px; border-radius: 2px; }
+  .gpu-detail .cell { gap: 4px; }
+  .detail-label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; margin-top: 4px; }
+  .detail-label > span:first-child { font-size: 13px; font-weight: 600; }
+  .metric b { text-align: right; color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .cells.gpu-cells { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .bar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--busy); transition: width .4s ease-out; }
+  .bar.warn > i { background: var(--warn); }
+  .bar.bad > i { background: var(--bad); }
+  .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 20px; }
+  .gauge { display: grid; grid-template-columns: 5rem 1fr auto; align-items: center; gap: 8px; font-size: 12.5px; }
+  .gauge .bar { height: 8px; border-radius: 4px; }
+  .nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px 20px; }
+  .node { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .cores { display: grid; gap: 2px; }
+  /* Overview: every section lays cells on the same 8-column grid, so GPU, CPU
+     and storage cells line up down the page. */
+  .grid8 { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 8px; }
+  .split { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; white-space: nowrap; overflow-wrap: normal; }
+  .split > :first-child { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .split > :last-child { flex: none; }
+  .cell.span-rows { justify-content: center; }
+  .cell .sub { font-size: 11.5px; color: var(--muted); }
+  .aside.hot { color: var(--bad); }
+  .cell-top .aside { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+  .cell.na { border-style: dashed; }
+  .cell.na .vals { color: var(--muted); }
+  .core-box { justify-content: center; }
+  .core-box .cores { grid-auto-rows: 1fr; flex: 1; min-height: 44px; }
+  .core-box .core { aspect-ratio: auto; }
+  .mount { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Narrow windows: 4 then 2 columns; CPU rows become NUMA + DRAM side by
+     side with the core squares full width below. */
+  @media (max-width: 760px) {
+    .grid8 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .grid8 > * { grid-row: auto !important; grid-column: auto !important; }
+    .grid8 > .half { grid-column: span 2 !important; }
+    .grid8 > .core-box, .grid8 > .span-rows { grid-column: 1 / -1 !important; }
+    .pill-text { display: none; }
+  }
+  @media (max-width: 520px) {
+    .grid8 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid8 > .half { grid-column: span 1 !important; }
+    .pill-text { display: inline; }
+  }
+  .core { aspect-ratio: 1; border-radius: 2px; background: color-mix(in srgb, var(--heat) calc(var(--p) * 1%), var(--track)); }
+  .core.hot { background: var(--bad); }
+  .heat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .heat-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px; }
+  .heat-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
+  .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; color: var(--muted); font-size: 12px; }
+  .legend .ramp { width: 90px; height: 10px; border-radius: 2px; background: linear-gradient(90deg, var(--track), var(--heat)); }
+  .legend .swatch { width: 14px; height: 14px; border-radius: 3px; }
+  .heat-rows { display: flex; flex-direction: column; gap: 6px; }
+  .heat-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+  .heat-row > a { width: 9rem; flex: none; color: var(--fg); font-size: 12.5px; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .heat-row > a:hover { text-decoration: underline; }
+  .heat-sq { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 8px; flex: 1 1 280px; min-width: 0; }
+  .hsq { position: relative; height: 38px; border-radius: 4px; overflow: hidden; display: flex; align-items: center; justify-content: center; font-size: 11.5px; font-weight: 600; color: var(--fg);
+    background: color-mix(in srgb, var(--heat) calc(var(--p) * 1%), var(--track)); }
+  .hsq.ink { color: var(--heat-ink); }
+  .hsq.est, .legend .swatch.est { background-image: repeating-linear-gradient(135deg, transparent 0 5px, color-mix(in srgb, var(--panel) 40%, transparent) 5px 7px); }
+  .legend .swatch.est { background-color: color-mix(in srgb, var(--heat) 50%, var(--track)); }
+  .hsq > i { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--fg); opacity: .5; }
+  @media (max-width: 560px) { .heat-row > a { width: 100%; } }
+  .head-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 10px; }
+  .btn { font: inherit; font-size: 13px; color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+  .btn:hover { background: var(--panel); }
+  .btn:focus-visible, .srv input:focus-visible { outline: 2px solid var(--heat); outline-offset: 1px; }
+  .btn.primary { background: var(--heat); border-color: var(--heat); color: var(--heat-ink); font-weight: 600; }
+  .btn.primary:disabled { opacity: .5; cursor: default; }
+  dialog#srv { width: min(600px, calc(100vw - 32px)); max-height: min(720px, calc(100vh - 48px)); padding: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--fg); }
+  dialog#srv::backdrop { background: rgb(0 0 0 / .6); }
+  .srv { display: flex; flex-direction: column; gap: 12px; padding: 18px 18px 16px; max-height: inherit; }
+  .srv-head { display: flex; flex-direction: column; gap: 2px; }
+  .srv-head h2 { font-size: 17px; font-weight: 600; margin: 0; }
+  .srv input[type=text], .srv input[type=search] { font: 13px var(--mono); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; min-width: 0; flex: 1; }
+  .srv input[type=search] { font-family: var(--sans); }
+  .srv-config { display: flex; align-items: center; gap: 8px; }
+  .srv-tools { display: flex; gap: 8px; }
+  .srv-list { overflow: auto; min-height: 120px; border: 1px solid var(--line); border-radius: 8px; padding: 4px; }
+  .srv-row { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 6px; cursor: pointer; }
+  .srv-row:hover { background: var(--bg); }
+  .srv-row input { margin: 0; accent-color: var(--heat); }
+  .srv-row .alias { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srv-row .addr { color: var(--muted); font: 12px var(--mono); }
+  .srv-empty { color: var(--muted); padding: 14px; text-align: center; }
+  .srv-foot { display: flex; align-items: center; gap: 8px; }
+  .srv-foot .meta { margin-right: auto; }
+  .empty-note { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; text-align: center; }
+  .tabs { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .tabs button { font: inherit; font-size: 13px; color: var(--muted); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
+  .tabs button + button { border-left: 1px solid var(--line); }
+  .tabs button[aria-pressed="true"] { background: var(--panel); color: var(--fg); font-weight: 600; }
+  .tabs button:focus-visible { outline: 2px solid var(--heat); outline-offset: -2px; }
+  .overview, .details { display: flex; flex-direction: column; gap: 14px; }
+  .overview h2 { font-size: 17px; font-weight: 600; margin: 0; }
+  .sec-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+  .sec-head:not(:first-child) { margin-top: 10px; }
+  .cell-top > span:first-child { white-space: nowrap; }
+  [hidden] { display: none !important; }
+  @media (prefers-reduced-motion: reduce) { .bar > i { transition: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Server Dashboard</h1>
+    <span class="status" id="status"><i class="dot"></i><span id="status-text">connecting…</span></span>
+    <div class="head-actions">
+      <button type="button" class="btn" id="srv-open">Servers</button>
+      <nav class="tabs" aria-label="View">
+        <button type="button" data-view="overview" aria-pressed="true">Overview</button>
+        <button type="button" data-view="details" aria-pressed="false">Details</button>
+      </nav>
+    </div>
+  </header>
+  <dialog id="srv" aria-labelledby="srv-title">
+    <div class="srv">
+      <div class="srv-head">
+        <h2 id="srv-title">Servers to track</h2>
+        <span class="meta">from an SSH config; applied live and remembered</span>
+      </div>
+      <label class="srv-config">
+        <span class="meta">SSH config</span>
+        <input id="srv-config" type="text" spellcheck="false" autocomplete="off">
+        <button type="button" class="btn" id="srv-load">Load</button>
+      </label>
+      <div class="srv-tools">
+        <input id="srv-filter" type="search" placeholder="Filter by name or address" autocomplete="off">
+        <button type="button" class="btn" id="srv-all">All</button>
+        <button type="button" class="btn" id="srv-none">None</button>
+      </div>
+      <div class="srv-list" id="srv-list" role="group" aria-label="Servers"></div>
+      <div class="err" id="srv-error" role="alert"></div>
+      <div class="srv-foot">
+        <span class="meta" id="srv-count"></span>
+        <button type="button" class="btn" id="srv-cancel">Cancel</button>
+        <button type="button" class="btn primary" id="srv-apply">Apply</button>
+      </div>
+    </div>
+  </dialog>
+  <section class="tiles">
+    <div class="tile"><span>Spare GPUs</span><b id="t-spare">—</b> <small id="t-gpus"></small></div>
+    <div class="tile"><span>Hosts reporting</span><b id="t-up">—</b> <small id="t-hosts"></small></div>
+    <div class="tile"><span>Free disk</span><b id="t-free">—</b> <small>TB</small></div>
+    <div class="tile"><span>Filesystems over 90% full</span><b id="t-full">—</b> <small id="t-fs"></small></div>
+  </section>
+  <section class="overview" id="view-overview" aria-labelledby="ov-title">
+    <div class="sec-head"><h2 id="ov-title">GPU utilization</h2><span class="meta">memory in use · utilization</span></div>
+    <div class="hosts" id="ov-hosts"></div>
+    <div class="sec-head"><h2>CPU utilization and memory bandwidth</h2><span class="meta">average per NUMA node · one square per CPU, top half physical cores · DRAM GB/s and share of peak</span></div>
+    <div class="hosts" id="ov-cpu"></div>
+    <div class="sec-head"><h2>Storage</h2><span class="meta">free space · share used</span></div>
+    <div class="hosts" id="ov-storage"></div>
+  </section>
+  <div class="details" id="view-details" hidden>
+  <section class="heat" aria-labelledby="heat-title">
+    <div class="heat-head">
+      <h2 id="heat-title">GPU compute across the pool</h2>
+      <div class="legend">
+        <span>SM active</span><span>0%</span><i class="ramp"></i><span>100%</span>
+        <i class="swatch est"></i><span>hatched: power draw vs limit, idle reads about 11% (host has no DCGM)</span>
+        <span>bottom line: memory in use</span>
+      </div>
+    </div>
+    <div class="heat-rows" id="heat"></div>
+  </section>
+  <section class="hosts" id="hosts"></section>
+  </div>
+</main>
+<script>
+  const DISK_WARN_PCT = 80, DISK_FULL_PCT = 90, LOAD_WARN_PCT = 80, LOAD_FULL_PCT = 95;
+  const CORE_HOT_PCT = 90;
+  // Theoretical peak per socket: 8 channels of DDR5-4800 at 38.4 GB/s each.
+  const MEMBW_PEAK_GBPS = 307;
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const level = (pct, warn, full) => (pct >= full ? 'bad' : pct >= warn ? 'warn' : '');
+  const bar = (pct, cls) => {
+    const outer = el('div', 'bar ' + cls);
+    const fill = el('i');
+    fill.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + '%';
+    outer.append(fill);
+    return outer;
+  };
+  const gauge = (name, pct, text) => {
+    const row = el('div', 'gauge');
+    row.append(el('span', 'meta', name), bar(pct, level(pct, LOAD_WARN_PCT, LOAD_FULL_PCT)), el('span', null, text));
+    return row;
+  };
+
+  const average = (values) => values.reduce((sum, v) => sum + v, 0) / Math.max(values.length, 1);
+  const hasDcgm = (host) => host.gpus.some((gpu) => gpu.sm_active_pct !== null);
+  // One labelled bar inside a GPU cell: name, fill, value.
+  // A labelled reading inside a GPU detail cell: name and value on one line,
+  // a thin full-width bar under it.
+  const metric = (name, pct, text) => {
+    const row = el('div', 'metric'), line = el('div', 'split');
+    line.append(el('span', null, name), el('b', null, text));
+    row.append(line, bar(pct, level(pct, LOAD_WARN_PCT, LOAD_FULL_PCT)));
+    return row;
+  };
+
+  // One overview cell: title (plus an optional muted aside), bar, then a value
+  // line with the amount on the left and the share on the right.
+  const span = (cls, parts) => {
+    const node = el('span', cls);
+    node.append(...[].concat(parts));
+    return node;
+  };
+  // cls colours the border; barCls colours the bar (defaults to cls).
+  const cellOf = ({ title, aside = '', pct, left, right, cls = level(pct, LOAD_WARN_PCT, LOAD_FULL_PCT), barCls = cls }) => {
+    const cell = el('div', 'cell ' + cls), top = el('div', 'cell-top'), vals = el('div', 'vals split');
+    top.append(typeof title === 'string' ? span(null, title) : title);
+    if (aside) top.append(typeof aside === 'string' ? span('aside', aside) : aside);
+    vals.append(span(null, left), span(null, right));
+    cell.append(top, bar(pct, barCls), vals);
+    return cell;
+  };
+  const bold = (text) => el('b', null, text);
+  const size = (gb) => (gb >= 1000 ? [bold((gb / 1024).toFixed(1)), ' TB'] : [bold(gb.toFixed(0)), ' GB']);
+  const gpuGb = (mib) => (mib >= 10 * 1024 ? (mib / 1024).toFixed(0) : (mib / 1024).toFixed(1));
+
+  // Per-host parts shared by the overview sections and the Details tab.
+  const cpuGauges = (host) => {
+    const stats = host.stats, gauges = el('div', 'gauges');
+    gauges.append(
+      gauge('CPU', stats.cpu_pct, `${stats.cpu_pct.toFixed(0)}% of ${stats.cpu_cores} cores`),
+      gauge('Memory', stats.mem_pct, `${stats.mem_used_gb.toFixed(0)} / ${stats.mem_total_gb.toFixed(0)} GB`));
+    return gauges;
+  };
+  // Columns for a node's core squares: split into the fewest equal rows (at
+  // least two) of at most MAX_CORE_COLUMNS, so every row is full and the grid
+  // fits beside the CPU cells (80 -> 4 x 20, 112 -> 4 x 28). With Linux
+  // numbering the top half is the physical cores, the bottom half their
+  // hyperthreads.
+  const MAX_CORE_COLUMNS = 28;
+  const coreColumns = (count) => {
+    for (let rows = 2; rows <= count; rows++) {
+      if (count % rows === 0 && count / rows <= MAX_CORE_COLUMNS && count / rows >= 2) return count / rows;
+    }
+    return Math.min(MAX_CORE_COLUMNS, Math.ceil(count / 2));
+  };
+  const coreGrid = (host) => {
+    const nodes = el('div', 'nodes');
+    for (const node of host.nodes) {
+      const hot = node.cores.filter((pct) => pct >= CORE_HOT_PCT).length;
+      const mean = node.cores.reduce((sum, pct) => sum + pct, 0) / Math.max(node.cores.length, 1);
+      const box = el('div', 'node'), meta = el('div', 'meta'), grid = el('div', 'cores');
+      meta.append(`NUMA ${node.id} · `, el('b', null, mean.toFixed(0) + '%'), ' average · ',
+        el('b', null, String(hot)), ` of ${node.cores.length} cores at ${CORE_HOT_PCT}% or more`);
+      const cols = coreColumns(node.cores.length);
+      grid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+      grid.style.maxWidth = cols * 12 + 'px';
+      grid.setAttribute('role', 'img');
+      grid.setAttribute('aria-label', `NUMA node ${node.id}: ${mean.toFixed(0)}% average CPU use`);
+      node.cores.forEach((pct, i) => {
+        const core = el('i', 'core' + (pct >= CORE_HOT_PCT ? ' hot' : ''));
+        core.style.setProperty('--p', pct.toFixed(0));
+        core.title = `CPU ${node.cpus[i]}: ${pct.toFixed(0)}%`;
+        grid.append(core);
+      });
+      box.append(meta, grid);
+      nodes.append(box);
+    }
+    return nodes;
+  };
+  const membwCells = (host) => {
+    if (host.membw_gbps.length) {
+      const sockets = el('div', 'cells');
+      host.membw_gbps.forEach((gbps, i) => {
+        const pct = 100 * gbps / MEMBW_PEAK_GBPS, cls = level(pct, LOAD_WARN_PCT, LOAD_FULL_PCT);
+        const cell = el('div', 'cell ' + cls), vals = el('div', 'vals');
+        vals.append(el('b', null, gbps.toFixed(1)), ' GB/s · ', el('b', null, pct.toFixed(0)), '% of peak');
+        cell.append(el('div', 'cell-top', 'Socket ' + i), bar(pct, cls), vals);
+        sockets.append(cell);
+      });
+      return sockets;
+    } else {
+      return el('div', 'meta', 'Not available: this host does not expose memory-bandwidth counters to regular users (resctrl is not mounted).');
+    }
+  };
+  const storageCells = (host) => {
+    const disks = el('div', 'cells');
+    for (const disk of [...host.disks].sort((a, b) => a.mount.localeCompare(b.mount))) {
+      const cls = level(disk.used_pct, DISK_WARN_PCT, DISK_FULL_PCT);
+      const cell = el('div', 'cell ' + cls), vals = el('div', 'vals');
+      vals.append(el('b', null, disk.free_gb.toFixed(0)), ' GB free · ', el('b', null, disk.used_pct.toFixed(0)), '%');
+      cell.append(el('div', 'mount', disk.mount), bar(disk.used_pct, cls), vals);
+      disks.append(cell);
+    }
+    return disks;
+  };
+
+  // Details: one card per host on the same 8-column grid as the overview —
+  // a summary row, one detailed cell per GPU, then the CPU/memory table and
+  // storage cells shared with the overview.
+  const naCell = (title, why) => {
+    const cell = cellOf({ title, pct: 0, left: 'n/a', right: '', cls: 'na' });
+    cell.title = why;
+    return cell;
+  };
+  const detailLabel = (title, caption) => {
+    const head = el('div', 'detail-label');
+    head.append(el('span', null, title));
+    if (caption) head.append(el('span', 'meta', caption));
+    return head;
+  };
+  const hostSummary = (host) => {
+    const grid = el('div', 'grid8'), stats = host.stats, gpus = host.gpus;
+    const used = gpus.reduce((sum, gpu) => sum + gpu.used_mib, 0) / 1024;
+    const total = gpus.reduce((sum, gpu) => sum + gpu.total_mib, 0) / 1024;
+    const busy = average(gpus.map((gpu) => gpu.util_pct));
+    const watts = gpus.reduce((sum, gpu) => sum + gpu.power_w, 0);
+    const limit = gpus.reduce((sum, gpu) => sum + gpu.power_limit_w, 0);
+    const free = host.disks.reduce((sum, disk) => sum + disk.free_gb, 0);
+    const space = host.disks.reduce((sum, disk) => sum + disk.free_gb / Math.max(1e-9, 1 - disk.used_pct / 100), 0);
+    const noDcgm = 'No DCGM host engine on this host, so SM and tensor-core activity are not measured.';
+    grid.append(
+      cellOf({ title: 'CPU', aside: `${stats.cpu_cores}`, pct: stats.cpu_pct, left: [bold(stats.cpu_pct.toFixed(0)), '%'], right: 'avg' }),
+      cellOf({ title: 'Memory', pct: stats.mem_pct, left: [bold(stats.mem_used_gb.toFixed(0)), ' GB'], right: [bold(stats.mem_pct.toFixed(0)), '%'] }),
+      cellOf({ title: 'GPU mem', pct: total ? 100 * used / total : 0, left: [bold(used.toFixed(0)), ' GB'], right: [bold((total ? 100 * used / total : 0).toFixed(0)), '%'] }),
+      cellOf({ title: 'GPU busy', pct: busy, left: [bold(busy.toFixed(0)), '%'], right: 'avg' }),
+      hasDcgm(host) ? cellOf({ title: 'SM active', pct: average(gpus.map((gpu) => gpu.sm_active_pct ?? 0)), left: [bold(average(gpus.map((gpu) => gpu.sm_active_pct ?? 0)).toFixed(0)), '%'], right: 'avg' }) : naCell('SM active', noDcgm),
+      hasDcgm(host) ? cellOf({ title: 'Tensor', pct: average(gpus.map((gpu) => gpu.tensor_active_pct ?? 0)), left: [bold(average(gpus.map((gpu) => gpu.tensor_active_pct ?? 0)).toFixed(0)), '%'], right: 'avg' }) : naCell('Tensor', noDcgm),
+      limit ? cellOf({ title: 'GPU power', pct: 100 * watts / limit, left: [bold((watts / 1000).toFixed(1)), ' kW'], right: [bold((100 * watts / limit).toFixed(0)), '%'] }) : naCell('GPU power', 'The GPUs do not report power.'),
+      cellOf({ title: 'Disk', pct: space ? 100 * (1 - free / space) : 0, left: [...size(free), ' free'], right: '', cls: '' }),
+    );
+    grid.firstChild.title = `CPU: ${stats.cpu_pct.toFixed(1)}% average over ${stats.cpu_cores} CPUs`;
+    return grid;
+  };
+  const gpuDetailCell = (gpu) => {
+    const state = gpu.spare ? 'spare' : gpu.claimed ? 'claimed' : 'busy';
+    const cls = gpu.spare ? 'ok' : gpu.claimed ? 'warn' : '';
+    const cell = el('div', 'cell ' + cls), top = el('div', 'cell-top'), pill = el('span', 'pill ' + cls);
+    pill.append(el('i', 'dot'), el('span', 'pill-text', state));
+    top.append(el('span', null, 'GPU ' + gpu.index), pill);
+    const memPct = 100 * gpu.used_mib / gpu.total_mib;
+    cell.append(top,
+      metric('Mem', memPct, gpuGb(gpu.used_mib) + ' GB'),
+      metric('Busy', gpu.util_pct, gpu.util_pct + '%'),
+      gpu.sm_active_pct !== null ? metric('SM', gpu.sm_active_pct, gpu.sm_active_pct.toFixed(0) + '%') : metric('SM', 0, '–'),
+      gpu.tensor_active_pct !== null ? metric('TC', gpu.tensor_active_pct, gpu.tensor_active_pct.toFixed(0) + '%') : metric('TC', 0, '–'),
+      gpu.power_limit_w ? metric('Pwr', 100 * gpu.power_w / gpu.power_limit_w, gpu.power_w.toFixed(0) + ' W') : metric('Pwr', 0, '–'));
+    cell.title = `GPU ${gpu.index}: ${gpuGb(gpu.used_mib)} of ${(gpu.total_mib / 1024).toFixed(0)} GB; a kernel ran ${gpu.util_pct}% of the time` +
+      (gpu.sm_active_pct !== null ? `; SMs active ${gpu.sm_active_pct.toFixed(1)}%, tensor cores ${gpu.tensor_active_pct.toFixed(1)}%` : '; no DCGM on this host') +
+      `; ${gpu.power_w.toFixed(0)} of ${gpu.power_limit_w.toFixed(0)} W`;
+    return cell;
+  };
+  const hostBlock = (host) => {
+    const block = el('div', 'host');
+    block.id = 'host-' + host.alias;
+    const head = el('div', 'host-head');
+    block.append(head);
+    const name = host.alias === 'local' && host.hostname ? host.hostname : host.alias;
+    if (host.state === 'connecting' || host.state === 'unreachable') {
+      head.append(el('span', 'host-name', name));
+      block.append(el('div', host.state === 'unreachable' ? 'err' : 'meta', host.state === 'unreachable' ? 'unreachable: ' + host.error : 'connecting…'));
+      return block;
+    }
+    const spare = host.gpus.filter((gpu) => gpu.spare).length;
+    const models = [...new Set(host.gpus.map((gpu) => gpu.name.replace(/^NVIDIA /, '')))].join(', ');
+    const meta = el('span', 'meta');
+    meta.append(models + ' · ', bold(String(spare)), ` of ${host.gpus.length} spare`);
+    head.append(el('span', 'host-name', name), meta);
+    if (host.hostname && host.hostname !== name) head.append(el('span', 'meta', host.hostname));
+    if (host.state === 'stale') head.append(el('span', 'err', `no update for ${Math.round(host.age)} s`));
+
+    const gpus = el('div', 'grid8 gpu-detail');
+    for (const gpu of host.gpus) gpus.append(gpuDetailCell(gpu));
+    block.append(
+      hostSummary(host),
+      detailLabel('GPUs', hasDcgm(host) ? 'Mem in use · Busy: any kernel running · SM / TC: multiprocessors / tensor cores active · Pwr: draw vs limit'
+        : 'Mem in use · Busy: any kernel running · Pwr: draw vs limit · SM / TC need DCGM, not running here'),
+      gpus,
+      detailLabel('CPU and memory', 'average per NUMA node · one square per CPU · DRAM GB/s and share of peak'),
+      ...cpuMemGrid(host),
+      detailLabel('Storage', 'free space · share used'),
+      ...storageGrid(host));
+    return block;
+  };
+
+  // Compute load for the heatmap: DCGM SM-active where the host has it, else
+  // power draw against the board limit (marked as an estimate).
+  const computeLoad = (gpu) => {
+    if (gpu.sm_active_pct !== null) return { pct: gpu.sm_active_pct, est: false };
+    return { pct: gpu.power_limit_w ? 100 * gpu.power_w / gpu.power_limit_w : 0, est: true };
+  };
+  const heatRow = (host) => {
+    const row = el('div', 'heat-row'), link = el('a', null, host.alias === 'local' && host.hostname ? host.hostname : host.alias);
+    if (host.hostname) link.title = host.hostname;
+    link.href = '#host-' + host.alias;
+    row.append(link);
+    if (!host.gpus) {
+      row.append(el('span', host.state === 'unreachable' ? 'err' : 'meta', host.state === 'unreachable' ? 'unreachable' : 'connecting…'));
+      return row;
+    }
+    const squares = el('div', 'heat-sq');
+    squares.setAttribute('role', 'img');
+    const parts = [];
+    for (const gpu of host.gpus) {
+      const load = computeLoad(gpu), mem = 100 * gpu.used_mib / gpu.total_mib;
+      const sq = el('div', 'hsq' + (load.est ? ' est' : '') + (load.pct >= 55 ? ' ink' : ''), load.pct.toFixed(0) + '%');
+      sq.style.setProperty('--p', load.pct.toFixed(0));
+      const memLine = el('i');
+      memLine.style.width = mem.toFixed(0) + '%';
+      sq.append(memLine);
+      const what = load.est ? `power ${gpu.power_w.toFixed(0)} of ${gpu.power_limit_w.toFixed(0)} W` :
+        `SM active ${gpu.sm_active_pct.toFixed(1)}%, tensor cores ${gpu.tensor_active_pct.toFixed(1)}%`;
+      sq.title = `GPU ${gpu.index}: ${what}; busy ${gpu.util_pct}%; memory ${(gpu.used_mib / 1024).toFixed(0)} of ${(gpu.total_mib / 1024).toFixed(0)} GB`;
+      parts.push(`GPU ${gpu.index} ${load.pct.toFixed(0)}%`);
+      squares.append(sq);
+    }
+    squares.setAttribute('aria-label', `${host.hostname} compute load: ${parts.join(', ')}`);
+    row.append(squares);
+    return row;
+  };
+
+  // Overview: one compact block per host with a cell per GPU (memory bar, GB and
+  // utilization), named by SSH alias.
+  const overviewBlock = (host) => {
+    const block = el('div', 'host'), head = el('div', 'host-head');
+    block.append(head);
+    const name = host.alias === 'local' && host.hostname ? host.hostname : host.alias;
+    head.append(el('span', 'host-name', name));
+    if (host.state === 'connecting' || host.state === 'unreachable') {
+      block.append(el('div', host.state === 'unreachable' ? 'err' : 'meta', host.state === 'unreachable' ? 'unreachable: ' + host.error : 'connecting…'));
+      return block;
+    }
+    const spare = host.gpus.filter((gpu) => gpu.spare).length;
+    const models = [...new Set(host.gpus.map((gpu) => gpu.name.replace(/^NVIDIA /, '')))].join(', ');
+    const meta = el('span', 'meta');
+    meta.append(models + ' · ', el('b', null, String(spare)), ` of ${host.gpus.length} spare`);
+    head.append(meta);
+    if (host.state === 'stale') head.append(el('span', 'err', `no update for ${Math.round(host.age)} s`));
+    const gpus = el('div', 'grid8');
+    for (const gpu of host.gpus) {
+      const state = gpu.spare ? 'spare' : gpu.claimed ? 'claimed' : 'busy';
+      const cls = gpu.spare ? 'ok' : gpu.claimed ? 'warn' : '';
+      const pill = el('span', 'pill ' + cls);
+      pill.append(el('i', 'dot'), el('span', 'pill-text', state));
+      const cell = cellOf({ title: 'GPU ' + gpu.index, aside: pill, pct: 100 * gpu.used_mib / gpu.total_mib,
+        left: [bold(gpuGb(gpu.used_mib)), ' GB'], right: [bold(String(gpu.util_pct)), '%'], cls, barCls: '' });
+      cell.title = `GPU ${gpu.index}: ${(gpu.used_mib / 1024).toFixed(1)} of ${(gpu.total_mib / 1024).toFixed(0)} GB memory, ${gpu.util_pct}% utilization`;
+      gpus.append(cell);
+    }
+    block.append(gpus);
+    return block;
+  };
+
+  // Opens on the grouped GPU view; #details in the URL opens Details instead.
+  // One block per host in an overview section: the host name, then build(host).
+  const sectionBlock = (host, build, summary) => {
+    const block = el('div', 'host'), head = el('div', 'host-head');
+    head.append(el('span', 'host-name', host.alias === 'local' && host.hostname ? host.hostname : host.alias));
+    block.append(head);
+    if (host.state === 'connecting' || host.state === 'unreachable') {
+      block.append(el('div', host.state === 'unreachable' ? 'err' : 'meta', host.state === 'unreachable' ? 'unreachable: ' + host.error : 'connecting…'));
+      return block;
+    }
+    if (summary) head.append(span('meta', summary(host)));
+    block.append(...build(host));
+    return block;
+  };
+  const coreSquares = (node) => {
+    const grid = el('div', 'cores');
+    grid.style.gridTemplateColumns = `repeat(${coreColumns(node.cores.length)}, minmax(0, 1fr))`;
+    grid.setAttribute('role', 'img');
+    grid.setAttribute('aria-label', `NUMA node ${node.id}: ${average(node.cores).toFixed(0)}% average CPU use`);
+    node.cores.forEach((pct, i) => {
+      const core = el('i', 'core' + (pct >= CORE_HOT_PCT ? ' hot' : ''));
+      core.style.setProperty('--p', pct.toFixed(0));
+      core.title = `CPU ${node.cpus[i]}: ${pct.toFixed(0)}%`;
+      grid.append(core);
+    });
+    return grid;
+  };
+  const place = (node, column, row) => {
+    node.style.gridColumn = column;
+    node.style.gridRow = row;
+    return node;
+  };
+  const cpuMemGrid = (host) => {
+    const grid = el('div', 'grid8'), stats = host.stats, rows = Math.max(host.nodes.length, 1);
+    // DRAM counters come per L3 domain; when that matches the NUMA nodes each
+    // row gets its own socket, otherwise the first row shows the total.
+    const perNode = host.membw_gbps.length === host.nodes.length;
+    host.nodes.forEach((node, i) => {
+      const mean = average(node.cores), hot = node.cores.filter((pct) => pct >= CORE_HOT_PCT).length;
+      const numa = cellOf({ title: 'NUMA ' + node.id, aside: hot ? span('aside hot', `${hot} hot`) : '', pct: mean,
+        left: [bold(mean.toFixed(0)), '%'], right: 'avg' });
+      numa.title = `NUMA ${node.id}: ${mean.toFixed(1)}% average over ${node.cores.length} CPUs, ${hot} at ${CORE_HOT_PCT}% or more`;
+      const box = el('div', 'cell core-box');
+      box.append(coreSquares(node));
+      let dram;
+      const gbps = perNode ? host.membw_gbps[i] : (i === 0 && host.membw_gbps.length ? host.membw_gbps.reduce((a, b) => a + b, 0) : null);
+      if (gbps !== null) {
+        const peak = MEMBW_PEAK_GBPS * (perNode ? 1 : host.membw_gbps.length), pct = 100 * gbps / peak;
+        dram = cellOf({ title: perNode ? 'DRAM ' + i : 'DRAM', pct, left: [bold(gbps.toFixed(1)), ' GB/s'], right: [bold(pct.toFixed(0)), '%'] });
+      } else {
+        dram = cellOf({ title: perNode || i === 0 ? 'DRAM ' + i : 'DRAM', pct: 0, left: 'n/a', right: '', cls: 'na' });
+        dram.title = 'Memory-bandwidth counters are not available: resctrl is not mounted on this host.';
+      }
+      // order only matters on narrow windows, where cells flow instead of being placed.
+      numa.classList.add('half');
+      dram.classList.add('half');
+      numa.style.order = 3 * i;
+      dram.style.order = 3 * i + 1;
+      box.style.order = 3 * i + 2;
+      grid.append(place(numa, '1', String(i + 1)), place(box, '2 / span 5', String(i + 1)), place(dram, '7', String(i + 1)));
+    });
+    const memory = cellOf({ title: 'Memory', pct: stats.mem_pct,
+      left: [bold(stats.mem_used_gb.toFixed(0)), ' GB'], right: [bold(stats.mem_pct.toFixed(0)), '%'] });
+    memory.classList.add('span-rows');
+    memory.style.order = 3 * rows;
+    memory.append(el('div', 'sub', `of ${stats.mem_total_gb.toFixed(0)} GB`));
+    grid.append(place(memory, '8', `1 / span ${rows}`));
+    return [grid];
+  };
+  const cpuSection = (host) => sectionBlock(host, cpuMemGrid, (h) => [bold(h.stats.cpu_pct.toFixed(0) + '%'), ` CPU over ${h.stats.cpu_cores} CPUs`]);
+  const storageGrid = (host) => {
+    const grid = el('div', 'grid8');
+    for (const disk of [...host.disks].sort((a, b) => a.mount.localeCompare(b.mount))) {
+      const cell = cellOf({ title: span('mount', disk.mount), pct: disk.used_pct, left: size(disk.free_gb),
+        right: [bold(disk.used_pct.toFixed(0)), '%'], cls: level(disk.used_pct, DISK_WARN_PCT, DISK_FULL_PCT) });
+      cell.title = `${disk.mount}: ${disk.free_gb.toFixed(0)} GB free, ${disk.used_pct.toFixed(1)}% used`;
+      grid.append(cell);
+    }
+    return [grid];
+  };
+  const storageSection = (host) => sectionBlock(host, storageGrid, (h) => [...size(h.disks.reduce((sum, d) => sum + d.free_gb, 0)), ' free']);
+
+  let view = location.hash === '#details' ? 'details' : 'overview';
+  let lastState = null;
+  const showView = (next) => {
+    view = next;
+    for (const button of document.querySelectorAll('.tabs button')) button.setAttribute('aria-pressed', String(button.dataset.view === view));
+    document.getElementById('view-overview').hidden = view !== 'overview';
+    document.getElementById('view-details').hidden = view !== 'details';
+    history.replaceState(null, '', view === 'details' ? '#details' : location.pathname);
+    if (lastState) draw(lastState);
+  };
+  for (const button of document.querySelectorAll('.tabs button')) button.addEventListener('click', () => showView(button.dataset.view));
+
+  const set = (id, text) => { document.getElementById(id).textContent = text; };
+  const draw = (state) => {
+    const live = state.hosts.filter((host) => host.gpus);
+    const gpus = live.flatMap((host) => host.gpus), disks = live.flatMap((host) => host.disks);
+    set('t-spare', gpus.filter((gpu) => gpu.spare).length);
+    set('t-gpus', 'of ' + gpus.length);
+    set('t-up', live.filter((host) => host.state === 'ok').length);
+    set('t-hosts', 'of ' + state.hosts.length);
+    set('t-free', (disks.reduce((sum, disk) => sum + disk.free_gb, 0) / 1024).toFixed(1));
+    set('t-full', disks.filter((disk) => disk.used_pct >= DISK_FULL_PCT).length);
+    set('t-fs', 'of ' + disks.length);
+    lastState = state;
+    if (!state.hosts.length) {
+      const note = el('div', 'empty-note', 'No servers are tracked. Open Servers to choose some.');
+      document.getElementById('ov-hosts').replaceChildren(note);
+      document.getElementById('ov-cpu').replaceChildren();
+      document.getElementById('ov-storage').replaceChildren();
+      document.getElementById('heat').replaceChildren();
+      document.getElementById('hosts').replaceChildren(note.cloneNode(true));
+    } else if (view === 'overview') {
+      document.getElementById('ov-hosts').replaceChildren(...state.hosts.map(overviewBlock));
+      document.getElementById('ov-cpu').replaceChildren(...state.hosts.map(cpuSection));
+      document.getElementById('ov-storage').replaceChildren(...state.hosts.map(storageSection));
+    } else {
+      document.getElementById('heat').replaceChildren(...state.hosts.map(heatRow));
+      document.getElementById('hosts').replaceChildren(...state.hosts.map(hostBlock));
+    }
+    document.getElementById('status').className = 'status ok';
+    set('status-text', `live · updated ${new Date(state.at * 1000).toLocaleTimeString()} · every ${state.interval} s`);
+  };
+
+  let period = 1000;
+  const tick = async () => {
+    try {
+      const response = await fetch('api/state', { cache: 'no-store' });
+      const state = await response.json();
+      period = Math.max(250, state.interval * 1000);
+      draw(state);
+    } catch (error) {
+      document.getElementById('status').className = 'status bad';
+      set('status-text', 'lost connection to the live server; retrying');
+    }
+    setTimeout(tick, period);
+  };
+  // Servers panel: list the hosts of an SSH config, tick the ones to track.
+  const srv = {
+    dialog: document.getElementById('srv'), list: document.getElementById('srv-list'),
+    config: document.getElementById('srv-config'), filter: document.getElementById('srv-filter'),
+    error: document.getElementById('srv-error'), count: document.getElementById('srv-count'),
+    apply: document.getElementById('srv-apply'), hosts: [], checked: new Set(),
+  };
+  const srvMatches = (host) => {
+    const text = srv.filter.value.trim().toLowerCase();
+    return !text || host.alias.toLowerCase().includes(text) || host.hostname.toLowerCase().includes(text);
+  };
+  const srvRender = () => {
+    const rows = srv.hosts.filter(srvMatches).map((host) => {
+      const row = el('label', 'srv-row'), box = el('input');
+      box.type = 'checkbox';
+      box.checked = srv.checked.has(host.alias);
+      box.addEventListener('change', () => {
+        if (box.checked) srv.checked.add(host.alias); else srv.checked.delete(host.alias);
+        srvCount();
+      });
+      row.append(box, el('span', 'alias', host.alias), el('span', 'addr', host.hostname));
+      return row;
+    });
+    srv.list.replaceChildren(...(rows.length ? rows : [el('div', 'srv-empty', srv.hosts.length ? 'No server matches the filter.' : 'No hosts in this config.')]));
+    srvCount();
+  };
+  const srvCount = () => {
+    srv.count.textContent = `${srv.checked.size} of ${srv.hosts.length} selected`;
+    srv.apply.disabled = !srv.hosts.length;
+  };
+  const srvLoad = async (config) => {
+    srv.error.textContent = '';
+    const query = config === undefined ? '' : '?config=' + encodeURIComponent(config);
+    const doc = await (await fetch('api/hosts' + query, { cache: 'no-store' })).json();
+    srv.config.value = doc.ssh_config;
+    srv.hosts = doc.hosts;
+    srv.checked = new Set(doc.hosts.filter((host) => host.tracked).map((host) => host.alias));
+    if (doc.error) srv.error.textContent = doc.error;
+    srvRender();
+  };
+  document.getElementById('srv-open').addEventListener('click', async () => {
+    srv.filter.value = '';
+    srv.dialog.showModal();
+    try { await srvLoad(); } catch (error) { srv.error.textContent = 'Could not reach the dashboard server.'; }
+  });
+  document.getElementById('srv-load').addEventListener('click', () => srvLoad(srv.config.value.trim()));
+  srv.config.addEventListener('keydown', (event) => { if (event.key === 'Enter') srvLoad(srv.config.value.trim()); });
+  srv.filter.addEventListener('input', srvRender);
+  const srvSetVisible = (on) => {
+    for (const host of srv.hosts.filter(srvMatches)) { if (on) srv.checked.add(host.alias); else srv.checked.delete(host.alias); }
+    srvRender();
+  };
+  document.getElementById('srv-all').addEventListener('click', () => srvSetVisible(true));
+  document.getElementById('srv-none').addEventListener('click', () => srvSetVisible(false));
+  document.getElementById('srv-cancel').addEventListener('click', () => srv.dialog.close());
+  srv.apply.addEventListener('click', async () => {
+    srv.error.textContent = '';
+    const hosts = srv.hosts.map((host) => host.alias).filter((alias) => srv.checked.has(alias));
+    const response = await fetch('api/track', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ssh_config: srv.config.value.trim(), hosts }),
+    });
+    const doc = await response.json().catch(() => ({ error: 'Request failed (' + response.status + ').' }));
+    if (!response.ok) { srv.error.textContent = doc.error || 'Request failed.'; return; }
+    srv.dialog.close();
+  });
+
+  showView(view);
+  tick();
+</script>
+</body>
+</html>

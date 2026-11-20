@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+install.sh
+.venv/
+.ruff_cache/
