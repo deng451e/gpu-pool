@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import argparse
+import logging
 import shutil
 import subprocess
 import sys
@@ -61,9 +62,10 @@ DCGM_START = (
     "trap 'kill $dmon 2>/dev/null; rm -f $dcgm' EXIT; "
 )
 DCGM_READ = (
-    'awk \'$1=="GPU" && $3!="N/A" {s[$2]=$3; t[$2]=$4} '
+    'awk \'$1=="GPU" && $3!="N/A" && $4!="N/A" {s[$2]=$3; t[$2]=$4} '
     'END {for (g in s) print "g", g, s[g], t[g]}\' $dcgm; : > $dcgm'
 )
+logger = logging.getLogger(__name__)
 RECONNECT_SECONDS = 5
 # A host whose last report is older than this many intervals is shown as stale.
 STALE_INTERVALS = 5
@@ -172,6 +174,56 @@ def topology_usage(
     return nodes, membw, current
 
 
+def _publish(
+    alias: str,
+    args: argparse.Namespace,
+    block: list[str],
+    last_stat: str,
+    counters: Counters,
+    activity: dict[int, tuple[float, float]],
+    reports: dict[str, Report],
+) -> tuple[str, Counters]:
+    """Parse one complete report block and store it in ``reports[alias]``.
+
+    Args:
+        alias: SSH alias, or ``local`` for this machine.
+        args: Parsed command-line options.
+        block: Lines between the BEGIN and END markers.
+        last_stat: The previous ``/proc/stat`` CPU line, or ``""`` for none.
+        counters: Memory-bandwidth counters from the previous report.
+        activity: Latest DCGM reading per GPU, updated in place.
+        reports: Shared map of alias to latest report, updated in place.
+
+    Returns:
+        The ``/proc/stat`` line and counters to diff the next report against.
+
+    Raises:
+        ValueError, IndexError: The block holds a malformed row.
+    """
+    stat_at, dcgm_at = block.index(STAT), block.index(DCGM)
+    cut = block.index(DISK)
+    stat = block[stat_at + 1]
+    # The first sample has nothing to diff against: CPU reads 0.
+    stats = host_stats(last_stat or stat, stat)
+    now = time.time()
+    nodes, membw, counters = topology_usage(block[stat_at + 2 : dcgm_at], counters, now)
+    for row in block[dcgm_at + 1 : cut]:
+        _, gpu, sm, tensor = row.split()
+        activity[int(gpu)] = (100 * float(sm), 100 * float(tensor))
+    disks = []
+    for row in block[cut + 1 :]:
+        mount, size, avail = row.split()
+        disks.append(
+            Disk(mount, int(avail) / 1024**3, 100 * (1 - int(avail) / int(size)))
+        )
+    host = parse_probe(alias, block[:stat_at], args.max_used_mib, args.max_util)
+    for gpu in host.gpus:
+        if gpu.index in activity:
+            gpu.sm_active_pct, gpu.tensor_active_pct = activity[gpu.index]
+    reports[alias] = Report(host, disks, stats, now, nodes, membw)
+    return stat, counters
+
+
 def follow(
     alias: str,
     args: argparse.Namespace,
@@ -229,36 +281,14 @@ def follow(
             if line == BEGIN:
                 block = []
             elif line == END and {STAT, DCGM, DISK} <= set(block):
-                stat_at, dcgm_at = block.index(STAT), block.index(DCGM)
-                cut = block.index(DISK)
-                stat = block[stat_at + 1]
-                # The first sample has nothing to diff against: CPU reads 0.
-                stats = host_stats(last_stat or stat, stat)
-                last_stat = stat
-                now = time.time()
-                nodes, membw, counters = topology_usage(
-                    block[stat_at + 2 : dcgm_at], counters, now
-                )
-                for row in block[dcgm_at + 1 : cut]:
-                    _, gpu, sm, tensor = row.split()
-                    activity[int(gpu)] = (100 * float(sm), 100 * float(tensor))
-                disks = []
-                for row in block[cut + 1 :]:
-                    mount, size, avail = row.split()
-                    disks.append(
-                        Disk(
-                            mount,
-                            int(avail) / 1024**3,
-                            100 * (1 - int(avail) / int(size)),
-                        )
+                # One unparsable report must not end the reader: the remote
+                # loop would then block on a full pipe and the host freeze.
+                try:
+                    last_stat, counters = _publish(
+                        alias, args, block, last_stat, counters, activity, reports
                     )
-                host = parse_probe(
-                    alias, block[:stat_at], args.max_used_mib, args.max_util
-                )
-                for gpu in host.gpus:
-                    if gpu.index in activity:
-                        gpu.sm_active_pct, gpu.tensor_active_pct = activity[gpu.index]
-                reports[alias] = Report(host, disks, stats, now, nodes, membw)
+                except (ValueError, IndexError):
+                    logger.exception("%s: skipping unparsable report", alias)
             else:
                 block.append(line)
         if stop.is_set():
